@@ -1,5 +1,5 @@
 # Sadscript
-![logo](docs/logo.png)
+
 VB6风格的解释器 使用Rust编写
 
 ### VB6 语法亲和性
