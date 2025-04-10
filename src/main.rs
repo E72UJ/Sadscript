@@ -1,80 +1,173 @@
-// 导入所需的标准库模块
-use std::env;  // 用于处理环境变量
-use std::io::{self, BufRead, BufReader};  // 用于文件读取操作
+use clap::{Parser, Subcommand};
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::PathBuf;
+use std::process;
 
-fn main() {
-    // 尝试从环境变量获取脚本文件路径，或从命令行参数获取
-    let script_file = match env::var("SADSCRIPT_FILE") {
-        Ok(file) => file,  // 如果环境变量存在，使用它
-        Err(_) => {  // 如果环境变量不存在，查找命令行参数
-            let args: Vec<String> = env::args().collect();
-            if args.len() < 2 {
-                // 如果没有提供足够的命令行参数，显示使用说明并退出
-                println!("Usage: {} <script.sad> or set SADSCRIPT_FILE environment variable", args[0]);
-                return;
-            }
-            args[1].clone()  // 使用第一个命令行参数作为脚本文件路径
-        }
-    };
-    
-    // 使用获取到的脚本文件路径运行解释器
-    run_interpreter(&script_file);
+/// 简单的脚本语言解释器
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// 要执行的脚本文件
+    #[arg(value_name = "FILE")]
+    script_file: Option<PathBuf>,
+
+    /// 设置日志级别（保留参数）
+    #[arg(short, long, value_name = "LEVEL", default_value = "info")]
+    log_level: String,
+
+    /// 启用严格模式
+    #[arg(short, long)]
+    strict: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-// 运行解释器的函数，接收脚本文件路径作为参数
-fn run_interpreter(file_path: &str) {
-    // 打开指定的脚本文件，如果失败则panic
-    let file = std::fs::File::open(file_path).expect("Failed to open file");
-    // 创建一个缓冲读取器来高效读取文件
-    let reader = BufReader::new(file);
+#[derive(Subcommand)]
+enum Commands {
+    /// 交互式运行解释器
+    Repl {},
     
-    // 创建新的解释器实例
-    let mut interpreter = Interpreter::new();
-    // 逐行读取并解释文件内容
-    for line in reader.lines() {
-        let line = line.expect("Failed to read line");
-        interpreter.interpret_line(&line);
-    }
-    // 解释完成后，输出所有结果
-    interpreter.flush_output();
+    /// 执行代码片段
+    Exec {
+        /// 要执行的代码
+        #[arg(value_name = "CODE")]
+        code: String,
+    },
 }
 
-// 解释器结构体定义
 struct Interpreter {
-    output: String,  // 用于存储输出结果的字符串
+    output: String,
+    strict_mode: bool,
 }
 
 impl Interpreter {
-    // 创建新的解释器实例
-    fn new() -> Self {
+    fn new(strict_mode: bool) -> Self {
         Interpreter {
             output: String::new(),
+            strict_mode,
         }
     }
-    
-    // 解释单行代码的方法
+
     fn interpret_line(&mut self, line: &str) {
-        // 将行内容分割成空格分隔的标记
         let mut tokens = line.split_whitespace();
-        // 获取第一个标记（命令）
         match tokens.next() {
-            // 如果命令是"print"，处理打印操作
             Some("print") => {
-                // 将剩余标记合并为一个字符串
                 let value = tokens.collect::<Vec<&str>>().join(" ");
-                // 移除引号并将结果添加到输出缓冲区
-                self.output.push_str(&value.trim_matches('"'));
-                // 添加换行符
+                let cleaned = value.trim_matches('"');
+                
+                if self.strict_mode && cleaned.contains('\\') {
+                    eprintln!("严格模式错误：禁止使用转义字符");
+                    return;
+                }
+                
+                self.output.push_str(cleaned);
                 self.output.push('\n');
             }
-            // 忽略其他命令（当前版本只实现了print命令）
-            _ => (),
+            Some(cmd) if self.strict_mode => {
+                eprintln!("严格模式错误：未知命令 '{}'", cmd);
+            }
+            Some(_) => {} // 非严格模式忽略未知命令
+            None => {}
         }
     }
-    
-    // 输出并清空所有缓冲的内容
+
     fn flush_output(&mut self) {
         print!("{}", self.output);
         self.output.clear();
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // 处理环境变量配置
+    let config_path = env::var("MY_SCRIPT_CONFIG")
+        .unwrap_or_else(|_| "~/.myscript/config".to_string());
+    let debug_mode = env::var("MY_SCRIPT_DEBUG")
+        .unwrap_or_else(|_| "false".to_string()) == "true";
+
+    println!("配置文件路径: {}", config_path);
+    println!("调试模式: {}", debug_mode);
+
+    match &cli.command {
+        Some(Commands::Repl {}) => {
+            println!("启动交互式解释器...");
+            run_repl(cli.strict);
+        }
+        Some(Commands::Exec { code }) => {
+            println!("执行代码: {}", code);
+            execute_code(code.as_str(), cli.strict); // 修正此处
+        }
+        None => {
+            if let Some(path) = cli.script_file {
+                execute_script_file(&path, cli.strict);
+            } else {
+                println!("没有提供命令或脚本文件。使用 --help 查看帮助信息。");
+                process::exit(1);
+            }
+        }
+    }
+}
+
+fn run_repl(strict_mode: bool) {
+    println!("REPL 模式 (严格模式: {})", strict_mode);
+    let mut interpreter = Interpreter::new(strict_mode);
+    
+    let stdin = io::stdin();
+    loop {
+        print!(">> ");
+        io::Write::flush(&mut io::stdout()).unwrap();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break,  // Ctrl+D
+            Ok(_) => {
+                let line = line.trim();
+                if line.eq_ignore_ascii_case("exit") {
+                    break;
+                }
+                interpreter.interpret_line(line);
+                interpreter.flush_output();
+            }
+            Err(e) => {
+                eprintln!("读取输入错误: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+fn execute_code(code: &str, strict_mode: bool) {
+    let mut interpreter = Interpreter::new(strict_mode);
+    interpreter.interpret_line(code);
+    interpreter.flush_output();
+}
+
+fn execute_script_file(path: &PathBuf, strict_mode: bool) {
+    println!("执行脚本文件 (严格模式: {}): {:?}", strict_mode, path);
+    
+    match File::open(path) {
+        Ok(file) => {
+            let mut interpreter = Interpreter::new(strict_mode);
+            let reader = BufReader::new(file);
+            
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => interpreter.interpret_line(&line),
+                    Err(e) => {
+                        eprintln!("读取行错误: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+            
+            interpreter.flush_output();
+        }
+        Err(e) => {
+            eprintln!("无法打开文件: {}", e);
+            process::exit(1);
+        }
     }
 }
